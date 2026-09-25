@@ -1,0 +1,4 @@
+// Managed by niri-agent. Keep this file included
+// from config.kdl with: include "agents.kdl"
+// While a session starts, niri-agent briefly appends a window rule here that sends the
+// new nested niri window to its agent workspace without focusing it.
