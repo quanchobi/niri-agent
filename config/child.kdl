@@ -1,0 +1,33 @@
+// Config for the nested niri that each agent session runs.
+// Tuned for automation: no animations (screenshots settle instantly), no decorations,
+// every window fills the screen so the agent sees one app at a time.
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+prefer-no-csd
+
+animations {
+    off
+}
+
+screenshot-path null
+
+layout {
+    gaps 0
+    center-focused-column "never"
+    default-column-width { proportion 1.0; }
+    focus-ring { off; }
+    border { off; }
+}
+
+// For a human poking at the session. Mod is Alt inside a nested niri.
+binds {
+    Mod+Q { close-window; }
+    Mod+Left { focus-column-left; }
+    Mod+Right { focus-column-right; }
+    Mod+Up { focus-window-up; }
+    Mod+Down { focus-window-down; }
+    Mod+F { maximize-column; }
+}
