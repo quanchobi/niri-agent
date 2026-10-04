@@ -603,39 +603,66 @@ def start_session(name: str | None, output: str | None, width: int, height: int)
             output = focused["name"]
         target = pick_workspace(host, output)
 
+        # Everything from naming the workspace until session.json exists is one transaction:
+        # on any failure (including Ctrl-C) the nested niri, the workspace name and the
+        # session dir are rolled back. Without session.json, `stop` cannot find the session.
         proc = None
-        events = EventStream(host.path)
         try:
-            host.action("SetWorkspaceName", name=workspace, workspace={"Id": target["id"]})
-            events.drain()
-            write_agents_kdl(idle_kdl() + launch_rule(workspace, width, height))
-            while True:
-                ev = events.next(10)
-                if ev is None:
-                    raise Error(f"niri did not reload {AGENTS_KDL}; is it included from config.kdl?")
-                if "ConfigLoaded" in ev:
-                    if ev["ConfigLoaded"]["failed"]:
-                        raise Error("niri failed to load its config after writing agents.kdl; check `niri validate`")
-                    break
+            events = EventStream(host.path)
+            try:
+                host.action("SetWorkspaceName", name=workspace, workspace={"Id": target["id"]})
+                events.drain()
+                write_agents_kdl(idle_kdl() + launch_rule(workspace, width, height))
+                while True:
+                    ev = events.next(10)
+                    if ev is None:
+                        raise Error(f"niri did not reload {AGENTS_KDL}; is it included from config.kdl?")
+                    if "ConfigLoaded" in ev:
+                        if ev["ConfigLoaded"]["failed"]:
+                            raise Error("niri failed to load its config after writing agents.kdl; check `niri validate`")
+                        break
 
-            sdir.mkdir(parents=True)
-            with open(sdir / "niri.log", "wb") as log:
-                proc = subprocess.Popen(
-                    ["niri", "-c", str(CHILD_CONFIG)],
-                    env=child_env(host), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-            window = None
-            deadline = time.monotonic() + 15
-            while window is None:
-                if proc.poll() is not None:
-                    raise Error(f"nested niri exited with {proc.returncode}; see {sdir / 'niri.log'}")
-                if time.monotonic() > deadline:
-                    raise Error("nested niri window did not appear on the host")
-                ev = events.next(0.25)
-                w = (ev or {}).get("WindowOpenedOrChanged", {}).get("window")
-                if w and w["pid"] == proc.pid:
-                    window = w
+                sdir.mkdir(parents=True)
+                with open(sdir / "niri.log", "wb") as log:
+                    proc = subprocess.Popen(
+                        ["niri", "-c", str(CHILD_CONFIG)],
+                        env=child_env(host), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                window = None
+                deadline = time.monotonic() + 15
+                while window is None:
+                    if proc.poll() is not None:
+                        raise Error(f"nested niri exited with {proc.returncode}; see {sdir / 'niri.log'}")
+                    if time.monotonic() > deadline:
+                        raise Error("nested niri window did not appear on the host")
+                    ev = events.next(0.25)
+                    w = (ev or {}).get("WindowOpenedOrChanged", {}).get("window")
+                    if w and w["pid"] == proc.pid:
+                        window = w
+            finally:
+                # Drop the launch rule as soon as the window has mapped (or we gave up),
+                # so it cannot catch unrelated nested niris during the slower steps below.
+                events.close()
+                write_agents_kdl(idle_kdl())
+
+            if window["workspace_id"] != target["id"]:
+                host.action("MoveWindowToWorkspace", window_id=window["id"], reference={"Id": target["id"]}, focus=False)
+            niri_socket, display = find_nested_socket(proc.pid, 10)
+            screen = wait_for_nested(Niri(niri_socket), 10)
+            session = {
+                "name": name,
+                "pid": proc.pid,
+                "workspace": workspace,
+                "output": output,
+                "host_window_id": window["id"],
+                "wayland_display": display,
+                "niri_socket": niri_socket,
+                "screen": screen,
+                "dir": str(sdir),
+                "created": time.time(),
+            }
+            (sdir / "session.json").write_text(json.dumps(session, indent=2))
         except BaseException:
             if proc is not None:
                 terminate(proc.pid)
@@ -643,27 +670,6 @@ def start_session(name: str | None, output: str | None, width: int, height: int)
                 unname_workspace(host, workspace)
             shutil.rmtree(sdir, ignore_errors=True)
             raise
-        finally:
-            events.close()
-            write_agents_kdl(idle_kdl())
-
-        if window["workspace_id"] != target["id"]:
-            host.action("MoveWindowToWorkspace", window_id=window["id"], reference={"Id": target["id"]}, focus=False)
-        niri_socket, display = find_nested_socket(proc.pid, 10)
-        screen = wait_for_nested(Niri(niri_socket), 10)
-        session = {
-            "name": name,
-            "pid": proc.pid,
-            "workspace": workspace,
-            "output": output,
-            "host_window_id": window["id"],
-            "wayland_display": display,
-            "niri_socket": niri_socket,
-            "screen": screen,
-            "dir": str(sdir),
-            "created": time.time(),
-        }
-        (sdir / "session.json").write_text(json.dumps(session, indent=2))
         return session
 
 
