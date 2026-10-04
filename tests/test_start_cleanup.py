@@ -73,12 +73,13 @@ class StartCleanupTest(unittest.TestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        self.terminate = mock.patch.object(na, "terminate").start()
+        self.stop_child = mock.patch.object(na, "stop_child").start()
         self.unname = mock.patch.object(na, "unname_workspace").start()
         self.addCleanup(mock.patch.stopall)
 
     def assert_rolled_back(self):
-        self.terminate.assert_called_once_with(NESTED_PID)
+        self.stop_child.assert_called_once()
+        self.assertEqual(self.stop_child.call_args.args[0].pid, NESTED_PID)
         self.unname.assert_called_once_with(self.host, "agent-web")
         self.assertFalse((self.state / "sessions" / "web").exists())
         self.assertEqual(self.kdl_writes[-1], "IDLE")
@@ -108,7 +109,7 @@ class StartCleanupTest(unittest.TestCase):
             s = na.start_session("web", "DP-1", 1280, 800)
         self.assertEqual(s["pid"], NESTED_PID)
         self.assertTrue((self.state / "sessions" / "web" / "session.json").is_file())
-        self.terminate.assert_not_called()
+        self.stop_child.assert_not_called()
         self.unname.assert_not_called()
         self.assertEqual(self.kdl_writes[-1], "IDLE")
 
