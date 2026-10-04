@@ -31,7 +31,7 @@ flowchart LR
 
 ## Install
 
-From the repository checkout (`~/workspace/ai/niri-agent`):
+From a clone of this repository:
 
 ```bash
 ./install.sh
