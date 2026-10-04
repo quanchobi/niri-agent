@@ -446,10 +446,16 @@ def all_sessions() -> list[dict]:
 
 
 def pid_alive(pid: int) -> bool:
+    """True if pid is a running (not zombie) niri process."""
     try:
-        return Path(f"/proc/{pid}/comm").read_text().strip() == "niri"
+        stat = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
         return False
+    # Format: "pid (comm) state ...". comm may contain spaces or parens, so split on the last ")".
+    head, _, rest = stat.rpartition(")")
+    comm = head.partition("(")[2]
+    # A zombie keeps its comm until the parent reaps it, so it must not count as alive.
+    return comm == "niri" and rest.split()[:1] != ["Z"]
 
 
 def live_session(name: str) -> dict:
@@ -526,6 +532,7 @@ def find_nested_socket(pid: int, timeout: float) -> tuple[str, str]:
 
 
 def terminate(pid: int):
+    """Stop a session's nested niri by pid (used by `stop`, which has no Popen handle)."""
     if not pid_alive(pid):
         return
     with contextlib.suppress(ProcessLookupError):
@@ -537,6 +544,18 @@ def terminate(pid: int):
         time.sleep(0.05)
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, signal.SIGKILL)
+
+
+def stop_child(proc: subprocess.Popen):
+    """Stop a nested niri this process spawned, and reap it so no zombie is left."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 def unname_workspace(host: Niri, workspace: str):
@@ -603,67 +622,73 @@ def start_session(name: str | None, output: str | None, width: int, height: int)
             output = focused["name"]
         target = pick_workspace(host, output)
 
+        # Everything from naming the workspace until session.json exists is one transaction:
+        # on any failure (including Ctrl-C) the nested niri, the workspace name and the
+        # session dir are rolled back. Without session.json, `stop` cannot find the session.
         proc = None
-        events = EventStream(host.path)
         try:
-            host.action("SetWorkspaceName", name=workspace, workspace={"Id": target["id"]})
-            events.drain()
-            write_agents_kdl(idle_kdl() + launch_rule(workspace, width, height))
-            while True:
-                ev = events.next(10)
-                if ev is None:
-                    raise Error(f"niri did not reload {AGENTS_KDL}; is it included from config.kdl?")
-                if "ConfigLoaded" in ev:
-                    if ev["ConfigLoaded"]["failed"]:
-                        raise Error("niri failed to load its config after writing agents.kdl; check `niri validate`")
-                    break
+            events = EventStream(host.path)
+            try:
+                host.action("SetWorkspaceName", name=workspace, workspace={"Id": target["id"]})
+                events.drain()
+                write_agents_kdl(idle_kdl() + launch_rule(workspace, width, height))
+                while True:
+                    ev = events.next(10)
+                    if ev is None:
+                        raise Error(f"niri did not reload {AGENTS_KDL}; is it included from config.kdl?")
+                    if "ConfigLoaded" in ev:
+                        if ev["ConfigLoaded"]["failed"]:
+                            raise Error("niri failed to load its config after writing agents.kdl; check `niri validate`")
+                        break
 
-            sdir.mkdir(parents=True)
-            with open(sdir / "niri.log", "wb") as log:
-                proc = subprocess.Popen(
-                    ["niri", "-c", str(CHILD_CONFIG)],
-                    env=child_env(host), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-            window = None
-            deadline = time.monotonic() + 15
-            while window is None:
-                if proc.poll() is not None:
-                    raise Error(f"nested niri exited with {proc.returncode}; see {sdir / 'niri.log'}")
-                if time.monotonic() > deadline:
-                    raise Error("nested niri window did not appear on the host")
-                ev = events.next(0.25)
-                w = (ev or {}).get("WindowOpenedOrChanged", {}).get("window")
-                if w and w["pid"] == proc.pid:
-                    window = w
+                sdir.mkdir(parents=True)
+                with open(sdir / "niri.log", "wb") as log:
+                    proc = subprocess.Popen(
+                        ["niri", "-c", str(CHILD_CONFIG)],
+                        env=child_env(host), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                window = None
+                deadline = time.monotonic() + 15
+                while window is None:
+                    if proc.poll() is not None:
+                        raise Error(f"nested niri exited with {proc.returncode}; see {sdir / 'niri.log'}")
+                    if time.monotonic() > deadline:
+                        raise Error("nested niri window did not appear on the host")
+                    ev = events.next(0.25)
+                    w = (ev or {}).get("WindowOpenedOrChanged", {}).get("window")
+                    if w and w["pid"] == proc.pid:
+                        window = w
+            finally:
+                # Drop the launch rule as soon as the window has mapped (or we gave up),
+                # so it cannot catch unrelated nested niris during the slower steps below.
+                events.close()
+                write_agents_kdl(idle_kdl())
+
+            if window["workspace_id"] != target["id"]:
+                host.action("MoveWindowToWorkspace", window_id=window["id"], reference={"Id": target["id"]}, focus=False)
+            niri_socket, display = find_nested_socket(proc.pid, 10)
+            screen = wait_for_nested(Niri(niri_socket), 10)
+            session = {
+                "name": name,
+                "pid": proc.pid,
+                "workspace": workspace,
+                "output": output,
+                "host_window_id": window["id"],
+                "wayland_display": display,
+                "niri_socket": niri_socket,
+                "screen": screen,
+                "dir": str(sdir),
+                "created": time.time(),
+            }
+            (sdir / "session.json").write_text(json.dumps(session, indent=2))
         except BaseException:
             if proc is not None:
-                terminate(proc.pid)
+                stop_child(proc)
             with contextlib.suppress(Error, OSError):
                 unname_workspace(host, workspace)
             shutil.rmtree(sdir, ignore_errors=True)
             raise
-        finally:
-            events.close()
-            write_agents_kdl(idle_kdl())
-
-        if window["workspace_id"] != target["id"]:
-            host.action("MoveWindowToWorkspace", window_id=window["id"], reference={"Id": target["id"]}, focus=False)
-        niri_socket, display = find_nested_socket(proc.pid, 10)
-        screen = wait_for_nested(Niri(niri_socket), 10)
-        session = {
-            "name": name,
-            "pid": proc.pid,
-            "workspace": workspace,
-            "output": output,
-            "host_window_id": window["id"],
-            "wayland_display": display,
-            "niri_socket": niri_socket,
-            "screen": screen,
-            "dir": str(sdir),
-            "created": time.time(),
-        }
-        (sdir / "session.json").write_text(json.dumps(session, indent=2))
         return session
 
 
@@ -737,9 +762,17 @@ def cmd_stop(a):
     except Error:
         host = None
     targets = all_sessions() if a.all else [load_session(a.name)]
+    stopped, failed = [], []
     for s in targets:
-        stop_session(host, s)
-    emit({"stopped": [s["name"] for s in targets]})
+        try:
+            stop_session(host, s)
+        except (Error, OSError) as e:
+            failed.append(f"{s['name']}: {e}")
+        else:
+            stopped.append(s["name"])
+    emit({"stopped": stopped})
+    if failed:
+        raise Error("could not stop " + "; ".join(failed))
 
 
 def cmd_list(a):
@@ -755,7 +788,10 @@ def cmd_menu(a):
     names = [s["name"] for s in all_sessions() if pid_alive(s["pid"])]
     if not names:
         raise Error("no running agent sessions")
-    r = subprocess.run(shlex.split(a.dmenu), input="\n".join(names) + "\n", capture_output=True, text=True)
+    try:
+        r = subprocess.run(shlex.split(a.dmenu), input="\n".join(names) + "\n", capture_output=True, text=True)
+    except FileNotFoundError as e:
+        raise Error(f"launcher not found: {e.filename} (install it or pass --dmenu)") from None
     choice = r.stdout.strip()
     if choice in names:
         host_niri().action("FocusWorkspace", reference={"Name": WORKSPACE_PREFIX + choice})
