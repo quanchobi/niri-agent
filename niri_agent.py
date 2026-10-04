@@ -446,10 +446,16 @@ def all_sessions() -> list[dict]:
 
 
 def pid_alive(pid: int) -> bool:
+    """True if pid is a running (not zombie) niri process."""
     try:
-        return Path(f"/proc/{pid}/comm").read_text().strip() == "niri"
+        stat = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
         return False
+    # Format: "pid (comm) state ...". comm may contain spaces or parens, so split on the last ")".
+    head, _, rest = stat.rpartition(")")
+    comm = head.partition("(")[2]
+    # A zombie keeps its comm until the parent reaps it, so it must not count as alive.
+    return comm == "niri" and rest.split()[:1] != ["Z"]
 
 
 def live_session(name: str) -> dict:
@@ -526,6 +532,7 @@ def find_nested_socket(pid: int, timeout: float) -> tuple[str, str]:
 
 
 def terminate(pid: int):
+    """Stop a session's nested niri by pid (used by `stop`, which has no Popen handle)."""
     if not pid_alive(pid):
         return
     with contextlib.suppress(ProcessLookupError):
@@ -537,6 +544,18 @@ def terminate(pid: int):
         time.sleep(0.05)
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, signal.SIGKILL)
+
+
+def stop_child(proc: subprocess.Popen):
+    """Stop a nested niri this process spawned, and reap it so no zombie is left."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 def unname_workspace(host: Niri, workspace: str):
@@ -665,7 +684,7 @@ def start_session(name: str | None, output: str | None, width: int, height: int)
             (sdir / "session.json").write_text(json.dumps(session, indent=2))
         except BaseException:
             if proc is not None:
-                terminate(proc.pid)
+                stop_child(proc)
             with contextlib.suppress(Error, OSError):
                 unname_workspace(host, workspace)
             shutil.rmtree(sdir, ignore_errors=True)
