@@ -352,8 +352,12 @@ def build_keymap(keysyms: list[str]) -> tuple[str, dict[str, int]]:
     """XKB keymap with one single-level key per keysym, plus modifier keys. Returns (text, keysym -> evdev code)."""
     syms = list(dict.fromkeys([m[0] for m in MODIFIERS.values()] + keysyms))
     codes = {s: i + 1 for i, s in enumerate(syms)}  # evdev code; xkb keycode = evdev + 8
-    lines = ["xkb_keymap {", 'xkb_keycodes "(unnamed)" {', "minimum = 8;", f"maximum = {len(syms) + 8};"]
-    lines += [f"<K{c}> = {c + 8};" for c in codes.values()]
+    # GTK3's Wayland keyval->keycode lookup skips the keymap's max keycode (`keycode < max_keycode`),
+    # which breaks key bindings (BackSpace, Escape, arrows, ctrl+a) for a keysym placed there.
+    # xkbcommon derives max_keycode from declared keycodes, so declare one unused keycode past the last.
+    pad = len(syms) + 9
+    lines = ["xkb_keymap {", 'xkb_keycodes "(unnamed)" {', "minimum = 8;", f"maximum = {pad};"]
+    lines += [f"<K{c}> = {c + 8};" for c in codes.values()] + [f"<KPAD> = {pad};"]
     lines += ["};", 'xkb_types "(unnamed)" { include "complete" };',
               'xkb_compatibility "(unnamed)" { include "complete" };', 'xkb_symbols "(unnamed)" {']
     lines += [f"key <K{c}> {{[ {s} ]}};" for s, c in codes.items()]

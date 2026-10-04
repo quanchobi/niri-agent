@@ -1,3 +1,5 @@
+import ctypes
+import ctypes.util
 import struct
 import unittest
 
@@ -34,8 +36,33 @@ class KeymapTest(unittest.TestCase):
         for sym, code in codes.items():
             self.assertIn(f"<K{code}> = {code + 8};", text)
             self.assertIn(f"key <K{code}> {{[ {sym} ]}};", text)
-        self.assertIn(f"maximum = {max(codes.values()) + 8};", text)
         self.assertIn(f"modifier_map Mod1 {{ <K{codes['Alt_L']}> }};", text)
+
+    def test_every_key_is_below_max_keycode(self):
+        # GTK3 resolves key bindings via keycodes in [min_keycode, max_keycode); a keysym on
+        # max_keycode types text but never triggers BackSpace/Escape/arrow/ctrl bindings.
+        lib = ctypes.util.find_library("xkbcommon")
+        if not lib:
+            self.skipTest("libxkbcommon not available")
+        xkb = ctypes.CDLL(lib)
+        xkb.xkb_context_new.restype = ctypes.c_void_p
+        xkb.xkb_context_new.argtypes = [ctypes.c_int]
+        xkb.xkb_keymap_new_from_string.restype = ctypes.c_void_p
+        xkb.xkb_keymap_new_from_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        xkb.xkb_keymap_max_keycode.argtypes = [ctypes.c_void_p]
+        xkb.xkb_keymap_unref.argtypes = [ctypes.c_void_p]
+        xkb.xkb_context_unref.argtypes = [ctypes.c_void_p]
+        text, codes = na.build_keymap(["a", "BackSpace"])
+        ctx = xkb.xkb_context_new(0)
+        keymap = xkb.xkb_keymap_new_from_string(ctx, text.encode(), 1, 0)
+        self.assertTrue(keymap, "keymap failed to compile")
+        try:
+            max_keycode = xkb.xkb_keymap_max_keycode(keymap)
+            for sym, code in codes.items():
+                self.assertLess(code + 8, max_keycode, sym)
+        finally:
+            xkb.xkb_keymap_unref(keymap)
+            xkb.xkb_context_unref(ctx)
 
 
 class WireTest(unittest.TestCase):
