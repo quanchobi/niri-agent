@@ -743,9 +743,17 @@ def cmd_stop(a):
     except Error:
         host = None
     targets = all_sessions() if a.all else [load_session(a.name)]
+    stopped, failed = [], []
     for s in targets:
-        stop_session(host, s)
-    emit({"stopped": [s["name"] for s in targets]})
+        try:
+            stop_session(host, s)
+        except (Error, OSError) as e:
+            failed.append(f"{s['name']}: {e}")
+        else:
+            stopped.append(s["name"])
+    emit({"stopped": stopped})
+    if failed:
+        raise Error("could not stop " + "; ".join(failed))
 
 
 def cmd_list(a):
@@ -761,7 +769,10 @@ def cmd_menu(a):
     names = [s["name"] for s in all_sessions() if pid_alive(s["pid"])]
     if not names:
         raise Error("no running agent sessions")
-    r = subprocess.run(shlex.split(a.dmenu), input="\n".join(names) + "\n", capture_output=True, text=True)
+    try:
+        r = subprocess.run(shlex.split(a.dmenu), input="\n".join(names) + "\n", capture_output=True, text=True)
+    except FileNotFoundError as e:
+        raise Error(f"launcher not found: {e.filename} (install it or pass --dmenu)") from None
     choice = r.stdout.strip()
     if choice in names:
         host_niri().action("FocusWorkspace", reference={"Name": WORKSPACE_PREFIX + choice})
