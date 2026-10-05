@@ -71,7 +71,7 @@ niri-agent move web 640 400
 niri-agent msg web -- -j windows       # any `niri msg` command against the nested niri
 niri-agent msg web -- action close-window --id 3
 
-niri-agent list                        # sessions, alive flag, workspace, screen size
+niri-agent list                        # sessions, alive/bus_alive flags, workspace, screen size
 niri-agent show web                    # switch your view to agent-web
 niri-agent stop web                    # closes all its apps, removes the workspace
 niri-agent stop --all
@@ -106,7 +106,7 @@ binds {
 - Sessions have their own clipboard (the nested compositor's), separate from yours.
 - Apps on the private bus have no portals, keyring, dconf writes, notifications or accessibility bus. Flatpak file dialogs silently cancel; pass files on the command line instead (`niri-agent run web -- flatpak run org.example.App /path/to/file`). Theme settings normally read through the settings portal fall back to defaults (e.g. no dark mode).
 - `run --host-bus` apps are back on your bus, so their portal dialogs open on your desktop again.
-- If the nested niri crashes, `list` shows `"alive": false`; run `niri-agent stop <name>` to clean up.
+- If the nested niri crashes, `list` shows `"alive": false`; if the private bus dies, `"bus_alive": false` (apps lose D-Bus). Run `niri-agent stop <name>` to clean up. `stop` only signals processes whose boot id and start time match what `start` recorded, so a stale session left over from before a reboot never kills an unrelated process that reused its pid.
 
 ## Development
 

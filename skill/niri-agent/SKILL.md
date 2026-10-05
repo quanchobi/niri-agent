@@ -54,7 +54,7 @@ All commands print JSON. Errors go to stderr with exit code 1.
 - Never use `ydotool`, `wtype`, `xdotool`, `grim` or `niri msg` against the host yourself. They act on the user's desktop.
 - Never export the session's `WAYLAND_DISPLAY` or `NIRI_SOCKET` into your shell. Pass everything through `niri-agent`.
 - One session per task. Reuse it across steps and stop it at the end, including after failures.
-- `niri-agent list` shows sessions; a session with `"alive": false` needs `niri-agent stop <name>`.
+- `niri-agent list` shows sessions; a session with `"alive": false` or `"bus_alive": false` needs `niri-agent stop <name>` (start a new one to continue).
 - Only use `niri-agent run --host-bus NAME -- ...` when an app needs the user's keyring or saved logins, and say so. Such an app's portal dialogs (file pickers) open on the user's desktop; never trigger them.
 - The user can watch with `niri-agent show <name>`. Do not call it yourself: it switches the user's view.
 - Key names: letters, digits, punctuation, `Return`/`enter`, `Tab`, `Escape`/`esc`, `BackSpace`, `Delete`, `space`, arrows (`Up`, `left`, ...), `Home`, `End`, `pgup`, `pgdn`, `F1`-`F24`, or any XKB keysym name.
