@@ -4,7 +4,8 @@
 Each session is a nested niri compositor whose window lives on its own named
 workspace ("agent-<name>") of the host niri. Agents drive the nested session
 with a virtual pointer/keyboard and screenshots, so the host desktop's focus and
-input are never touched.
+input are never touched. Apps in a session talk to a private D-Bus session bus,
+so portal dialogs and single-instance apps cannot reach the host desktop either.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 REPO = Path(__file__).resolve().parent
 CHILD_CONFIG = REPO / "config" / "child.kdl"
@@ -42,6 +44,13 @@ SOCKET_RE = re.compile(r"^niri\.(?P<display>.+)\.(?P<pid>\d+)\.sock$")
 # Env vars that would let the nested niri window grab focus on the host
 # (xdg-activation), or leak the host session into the nested one.
 STRIPPED_ENV = ("XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID", "NIRI_SOCKET", "DISPLAY")
+# The only services a session's private bus can activate. flatpak-portal backs
+# `flatpak-spawn --sandbox` (GNOME runtimes decode icons in a helper started through it),
+# and the session helper serves `flatpak run`. xdg-desktop-portal and the document portal
+# are left out on purpose: their dialogs would open on the host desktop, and bridging the
+# document portal to the host would hand sandboxed apps host-level trust.
+PRIVATE_BUS_SERVICES = ("org.freedesktop.portal.Flatpak", "org.freedesktop.Flatpak")
+_DBUS_ADDRESS_SAFE = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_/.\\*")
 
 
 class Error(Exception):
@@ -449,22 +458,38 @@ def all_sessions() -> list[dict]:
     return out
 
 
-def pid_alive(pid: int) -> bool:
-    """True if pid is a running (not zombie) niri process."""
+def proc_start(pid: int) -> str | None:
+    """Identity of a live (non-zombie) pid: boot id plus start time.
+
+    session.json outlives reboots, and after one a recorded pid can belong to anything,
+    including the user's own niri or session dbus-daemon. Boot id + start time never
+    matches a different process, so nothing is signalled unless it is provably ours."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     except OSError:
-        return False
-    # Format: "pid (comm) state ...". comm may contain spaces or parens, so split on the last ")".
-    head, _, rest = stat.rpartition(")")
-    comm = head.partition("(")[2]
-    # A zombie keeps its comm until the parent reaps it, so it must not count as alive.
-    return comm == "niri" and rest.split()[:1] != ["Z"]
+        return None
+    # "pid (comm) state ... starttime ...": comm may contain spaces or parens, so split on the
+    # last ")". Field 3 (state) is then index 0 and field 22 (starttime) index 19.
+    fields = stat.rpartition(")")[2].split()
+    if fields[0] == "Z":  # a zombie keeps its pid until the parent reaps it
+        return None
+    return f"{boot}:{fields[19]}"
+
+
+def pid_alive(pid: int, start: str | None) -> bool:
+    """True if pid is still the process whose proc_start() was recorded as `start`."""
+    return start is not None and proc_start(pid) == start
+
+
+def session_alive(s: dict) -> bool:
+    # Sessions recorded before identities existed have no pid_start and count as dead.
+    return pid_alive(s["pid"], s.get("pid_start"))
 
 
 def live_session(name: str) -> dict:
     s = load_session(name)
-    if not pid_alive(s["pid"]):
+    if not session_alive(s):
         raise Error(f"session {name!r} is dead; clean it up with: niri-agent stop {name}")
     return s
 
@@ -514,14 +539,113 @@ def check_installed():
     raise Error(f'no `include "agents.kdl"` found under {NIRI_CONFIG_DIR}; run install.sh')
 
 
-def child_env(host: Niri) -> dict:
+def child_env(host: Niri, bus_address: str) -> dict:
     env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
     env["WAYLAND_DISPLAY"] = host_wayland_display(host)
     # The host throttles frame callbacks for windows on hidden workspaces to ~1/s. With a
     # blocking eglSwapBuffers the nested niri's event loop stalls for that long after every
     # redraw, delaying input and IPC. Mesa's Wayland EGL maps vblank_mode=0 to swap interval 0.
     env["vblank_mode"] = "0"
+    # Everything the nested niri spawns inherits this. A non-session niri exports no D-Bus
+    # interfaces itself, so the bus may come up after niri does.
+    env["DBUS_SESSION_BUS_ADDRESS"] = bus_address
     return env
+
+
+# --------------------------------------------------------------------------- private session bus
+
+
+def dbus_unix_address(path: Path) -> str:
+    raw = os.fsencode(path)
+    return "unix:path=" + "".join(chr(b) if b in _DBUS_ADDRESS_SAFE else f"%{b:02x}" for b in raw)
+
+
+def host_bus_address() -> str | None:
+    addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+    if addr:
+        return addr
+    default = runtime_dir() / "bus"  # where GDBus/sd-bus look when the variable is unset
+    return dbus_unix_address(default) if default.is_socket() else None
+
+
+def dbus_service_dirs() -> list[Path]:
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    data_dirs = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    return [Path(d) / "dbus-1" / "services" for d in [str(data_home), *data_dirs.split(":")] if d]
+
+
+def write_private_services(dest: Path, search: list[Path]) -> list[str]:
+    """Activation files for PRIVATE_BUS_SERVICES only, reduced to Name and Exec.
+
+    Dropping SystemdService makes the private daemon exec the service itself instead of
+    asking the host's systemd user manager, which would start it on the host bus.
+    Returns the names no service file was found for."""
+    dest.mkdir(parents=True, exist_ok=True)
+    missing = []
+    for name in PRIVATE_BUS_SERVICES:
+        for d in search:
+            try:
+                lines = (d / f"{name}.service").read_text().splitlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+            keys = dict(line.split("=", 1) for line in lines if "=" in line and not line.startswith("#"))
+            if keys.get("Name") == name and keys.get("Exec"):
+                (dest / f"{name}.service").write_text(f"[D-BUS Service]\nName={name}\nExec={keys['Exec']}\n")
+                break
+        else:
+            missing.append(name)
+    return missing
+
+
+def bus_config(address: str, services: Path) -> str:
+    return f"""<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>{xml_escape(address)}</listen>
+  <auth>EXTERNAL</auth>
+  <servicedir>{xml_escape(str(services))}</servicedir>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"""
+
+
+def start_bus(sdir: Path, address: str, env: dict) -> subprocess.Popen:
+    """Run the session's private dbus-daemon; returns once it accepts connections."""
+    services = sdir / "dbus-services"
+    search = dbus_service_dirs()
+    missing = write_private_services(services, search)
+    (sdir / "dbus.conf").write_text(bus_config(address, services))
+    with open(sdir / "dbus.log", "wb") as log:
+        if missing:
+            note = f"no D-Bus service file for {', '.join(missing)} in {':'.join(map(str, search))}"
+            log.write(f"niri-agent: {note}\n".encode())
+            log.flush()
+            if shutil.which("flatpak"):
+                # GNOME runtimes decode icons through flatpak-spawn, which needs flatpak-portal.
+                print(f"niri-agent: warning: {note}; flatpak apps in this session may fail", file=sys.stderr)
+        try:
+            proc = subprocess.Popen(
+                ["dbus-daemon", "--nofork", f"--config-file={sdir / 'dbus.conf'}", "--print-address=1"],
+                env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log, start_new_session=True,
+            )
+        except FileNotFoundError:
+            raise Error("dbus-daemon not found; install the dbus package") from None
+    try:
+        # The address is printed once the daemon is listening.
+        ready, _, _ = select.select([proc.stdout], [], [], 10)
+        line = proc.stdout.readline() if ready else b""
+        proc.stdout.close()
+        if not line.strip():
+            raise Error(f"private dbus-daemon did not start; see {sdir / 'dbus.log'}")
+    except BaseException:
+        stop_child(proc)
+        raise
+    return proc
 
 
 def find_nested_socket(pid: int, timeout: float) -> tuple[str, str]:
@@ -535,19 +659,22 @@ def find_nested_socket(pid: int, timeout: float) -> tuple[str, str]:
     raise Error(f"nested niri (pid {pid}) did not create its IPC socket")
 
 
-def terminate(pid: int):
-    """Stop a session's nested niri by pid (used by `stop`, which has no Popen handle)."""
-    if not pid_alive(pid):
+def terminate(pid: int, start: str | None):
+    """Stop a session process by pid (used by `stop`, which has no Popen handle).
+
+    Only signals the process recorded at spawn: see proc_start()."""
+    if not pid_alive(pid, start):
         return
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        if not pid_alive(pid):
+        if not pid_alive(pid, start):
             return
         time.sleep(0.05)
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
+    if pid_alive(pid, start):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
 
 
 def stop_child(proc: subprocess.Popen):
@@ -625,11 +752,14 @@ def start_session(name: str | None, output: str | None, width: int, height: int)
                 raise Error("no focused output; pass --output")
             output = focused["name"]
         target = pick_workspace(host, output)
+        bus_socket = runtime_dir() / f"niri-agent-{name}.bus"
+        bus_address = dbus_unix_address(bus_socket)
+        host_bus = host_bus_address()
 
         # Everything from naming the workspace until session.json exists is one transaction:
-        # on any failure (including Ctrl-C) the nested niri, the workspace name and the
-        # session dir are rolled back. Without session.json, `stop` cannot find the session.
-        proc = None
+        # on any failure (including Ctrl-C) the nested niri, its bus, the workspace name and
+        # the session dir are rolled back. Without session.json, `stop` cannot find the session.
+        proc = bus = None
         try:
             events = EventStream(host.path)
             try:
@@ -649,7 +779,7 @@ def start_session(name: str | None, output: str | None, width: int, height: int)
                 with open(sdir / "niri.log", "wb") as log:
                     proc = subprocess.Popen(
                         ["niri", "-c", str(CHILD_CONFIG)],
-                        env=child_env(host), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                        env=child_env(host, bus_address), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                         start_new_session=True,
                     )
                 window = None
@@ -672,16 +802,27 @@ def start_session(name: str | None, output: str | None, width: int, height: int)
             if window["workspace_id"] != target["id"]:
                 host.action("MoveWindowToWorkspace", window_id=window["id"], reference={"Id": target["id"]}, focus=False)
             niri_socket, display = find_nested_socket(proc.pid, 10)
+            # Services the bus activates (e.g. sandboxed flatpak helpers) belong to the session.
+            bus_env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
+            bus_env.update(WAYLAND_DISPLAY=display, DBUS_SESSION_BUS_ADDRESS=bus_address)
+            bus_socket.unlink(missing_ok=True)
+            bus = start_bus(sdir, bus_address, bus_env)
             screen = wait_for_nested(Niri(niri_socket), 10)
             session = {
                 "name": name,
                 "pid": proc.pid,
+                # Both are our unreaped children here, so their pids cannot have been reused yet.
+                "pid_start": proc_start(proc.pid),
                 "workspace": workspace,
                 "output": output,
                 "host_window_id": window["id"],
                 "wayland_display": display,
                 "niri_socket": niri_socket,
                 "screen": screen,
+                "bus_pid": bus.pid,
+                "bus_start": proc_start(bus.pid),
+                "bus_socket": str(bus_socket),
+                "host_bus": host_bus,
                 "dir": str(sdir),
                 "created": time.time(),
             }
@@ -689,6 +830,9 @@ def start_session(name: str | None, output: str | None, width: int, height: int)
         except BaseException:
             if proc is not None:
                 stop_child(proc)
+            if bus is not None:
+                stop_child(bus)
+                bus_socket.unlink(missing_ok=True)
             with contextlib.suppress(Error, OSError):
                 unname_workspace(host, workspace)
             shutil.rmtree(sdir, ignore_errors=True)
@@ -697,7 +841,12 @@ def start_session(name: str | None, output: str | None, width: int, height: int)
 
 
 def stop_session(host: Niri | None, s: dict):
-    terminate(s["pid"])
+    # Sessions recorded before process identities existed lack the *_start keys: nothing
+    # can prove their pids are still ours, so they are cleaned up without signalling.
+    terminate(s["pid"], s.get("pid_start"))
+    if "bus_pid" in s:
+        terminate(s["bus_pid"], s.get("bus_start"))
+        Path(s["bus_socket"]).unlink(missing_ok=True)
     if host is not None:
         with contextlib.suppress(Error):
             unname_workspace(host, s["workspace"])
@@ -737,7 +886,9 @@ def emit(obj):
 def session_summary(s: dict) -> dict:
     return {
         "name": s["name"],
-        "alive": pid_alive(s["pid"]),
+        "alive": session_alive(s),
+        # If the private bus dies, apps in the session lose D-Bus while niri keeps running.
+        "bus_alive": pid_alive(s.get("bus_pid", 0), s.get("bus_start")),
         "workspace": s["workspace"],
         "output": s["output"],
         "screen": s["screen"],
@@ -789,7 +940,7 @@ def cmd_show(a):
 
 
 def cmd_menu(a):
-    names = [s["name"] for s in all_sessions() if pid_alive(s["pid"])]
+    names = [s["name"] for s in all_sessions() if session_alive(s)]
     if not names:
         raise Error("no running agent sessions")
     try:
@@ -804,9 +955,16 @@ def cmd_menu(a):
 def cmd_run(a):
     if not a.command:
         raise Error("missing command: niri-agent run NAME -- COMMAND [ARGS...]")
+    if a.command[0].startswith("-"):
+        raise Error(f"{a.command[0]!r} is not a command; options go before the name: niri-agent run --host-bus NAME -- COMMAND")
     s = live_session(a.name)
-    Niri(s["niri_socket"]).action("Spawn", command=a.command)
-    emit({"spawned": a.command})
+    command = a.command
+    if a.host_bus:
+        if not s.get("host_bus"):
+            raise Error(f"session {a.name!r} has no recorded host session bus; --host-bus is unavailable")
+        command = ["env", f"DBUS_SESSION_BUS_ADDRESS={s['host_bus']}", *command]
+    Niri(s["niri_socket"]).action("Spawn", command=command)
+    emit({"spawned": a.command, "bus": "host" if a.host_bus else "private"})
 
 
 def cmd_msg(a):
@@ -928,6 +1086,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(fn=cmd_menu)
 
     sp = sub.add_parser("run", help="launch an app inside the session")
+    sp.add_argument("--host-bus", action="store_true",
+                    help="connect the app to your session D-Bus instead of the session's private bus "
+                         "(keyring, dconf writes; portal dialogs may then open on your desktop)")
     sp.add_argument("name")
     sp.add_argument("command", nargs=argparse.REMAINDER)
     sp.set_defaults(fn=cmd_run)
