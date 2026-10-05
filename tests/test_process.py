@@ -1,6 +1,7 @@
 """Process lifetime helpers, exercised against a real process whose comm is "niri"."""
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -54,6 +55,31 @@ class FakeNiriProcessTest(unittest.TestCase):
 
     def test_non_niri_pid_is_not_alive(self):
         self.assertFalse(na.pid_alive(os.getpid()))
+
+
+@unittest.skipUnless(shutil.which("dbus-daemon") and shutil.which("dbus-send"), "needs dbus-daemon and dbus-send")
+class PrivateBusProcessTest(unittest.TestCase):
+    def test_bus_is_ready_on_return_cannot_activate_portals_and_stops(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        sdir = Path(tmp.name)
+        address = na.dbus_unix_address(sdir / "bus")
+        env = {**os.environ, "DBUS_SESSION_BUS_ADDRESS": address}
+        bus = na.start_bus(sdir, address, env)
+        self.addCleanup(lambda: (bus.poll() is None and bus.kill(), bus.wait()))
+
+        # Uses this machine's real service files: whatever is installed, portals stay out.
+        out = subprocess.run(
+            ["dbus-send", f"--bus={address}", "--print-reply", "--dest=org.freedesktop.DBus",
+             "/org/freedesktop/DBus", "org.freedesktop.DBus.ListActivatableNames"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout
+        names = set(re.findall(r'string "([^"]+)"', out)) - {"org.freedesktop.DBus"}
+        self.assertLessEqual(names, set(na.PRIVATE_BUS_SERVICES))
+
+        na.terminate(bus.pid, "dbus-daemon")
+        bus.wait(timeout=2)
+        self.assertFalse(na.pid_alive(bus.pid, "dbus-daemon"))
 
 
 if __name__ == "__main__":

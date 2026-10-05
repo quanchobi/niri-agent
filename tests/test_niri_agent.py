@@ -1,7 +1,9 @@
 import ctypes
 import ctypes.util
 import struct
+import tempfile
 import unittest
+from pathlib import Path
 
 import niri_agent as na
 
@@ -63,6 +65,29 @@ class KeymapTest(unittest.TestCase):
         finally:
             xkb.xkb_keymap_unref(keymap)
             xkb.xkb_context_unref(ctx)
+
+
+class PrivateBusTest(unittest.TestCase):
+    def write_service(self, d: Path, name: str, extra: str = ""):
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{name}.service").write_text(f"[D-BUS Service]\nName={name}\nExec=/usr/libexec/{d.name}-{name}\n{extra}")
+
+    def test_only_flatpak_services_are_activatable_and_never_via_systemd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            user, system, dest = Path(tmp, "user"), Path(tmp, "system"), Path(tmp, "dest")
+            for name in ("org.freedesktop.portal.Desktop", "org.freedesktop.portal.Documents",
+                         "org.freedesktop.impl.portal.desktop.gtk", *na.PRIVATE_BUS_SERVICES):
+                self.write_service(system, name, "SystemdService=x.service\n")
+            self.write_service(user, "org.freedesktop.portal.Flatpak")
+            na.write_private_services(dest, [user, system])
+            files = {p.name: p.read_text() for p in dest.iterdir()}
+        self.assertEqual(set(files), {f"{n}.service" for n in na.PRIVATE_BUS_SERVICES})
+        self.assertTrue(all("SystemdService" not in text for text in files.values()))
+        # Like dbus-daemon, the first directory (XDG_DATA_HOME) wins.
+        self.assertIn("Exec=/usr/libexec/user-org.freedesktop.portal.Flatpak", files["org.freedesktop.portal.Flatpak.service"])
+
+    def test_unix_address_escapes_unsafe_bytes(self):
+        self.assertEqual(na.dbus_unix_address(Path("/run/a b/x,y=z.bus")), "unix:path=/run/a%20b/x%2cy%3dz.bus")
 
 
 class WireTest(unittest.TestCase):

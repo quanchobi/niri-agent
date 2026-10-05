@@ -22,6 +22,7 @@ All commands print JSON. Errors go to stderr with exit code 1.
    niri-agent run a1 -- kitty
    ```
    Apps fill the screen. X11 apps work through xwayland-satellite if it is installed.
+   Apps get the session's private D-Bus, so flatpak file dialogs do not work: pass files as arguments instead, e.g. `niri-agent run a1 -- flatpak run com.orcaslicer.OrcaSlicer /path/to/model.stl`.
 3. Look, act, look again:
    ```bash
    niri-agent screenshot a1                 # -> {"path": ".../shots/....png", "width": 1280, "height": 800}
@@ -54,5 +55,6 @@ All commands print JSON. Errors go to stderr with exit code 1.
 - Never export the session's `WAYLAND_DISPLAY` or `NIRI_SOCKET` into your shell. Pass everything through `niri-agent`.
 - One session per task. Reuse it across steps and stop it at the end, including after failures.
 - `niri-agent list` shows sessions; a session with `"alive": false` needs `niri-agent stop <name>`.
+- Only use `niri-agent run --host-bus NAME -- ...` when an app needs the user's keyring or saved logins, and say so. Such an app's portal dialogs (file pickers) open on the user's desktop; never trigger them.
 - The user can watch with `niri-agent show <name>`. Do not call it yourself: it switches the user's view.
 - Key names: letters, digits, punctuation, `Return`/`enter`, `Tab`, `Escape`/`esc`, `BackSpace`, `Delete`, `space`, arrows (`Up`, `left`, ...), `Home`, `End`, `pgup`, `pgdn`, `F1`-`F24`, or any XKB keysym name.

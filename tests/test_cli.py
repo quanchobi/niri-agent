@@ -42,5 +42,34 @@ class StopAllTest(unittest.TestCase):
         self.assertIn('"a3"', out.getvalue())
 
 
+class RunBusTest(unittest.TestCase):
+    def spawned(self, session, argv):
+        nested = mock.Mock()
+        with mock.patch.object(na, "live_session", return_value=session), \
+             mock.patch.object(na, "Niri", return_value=nested), redirect_stdout(io.StringIO()):
+            na.main(argv)
+        nested.action.assert_called_once()
+        return nested.action.call_args.kwargs["command"]
+
+    def test_default_inherits_the_private_bus(self):
+        s = {"niri_socket": "/x.sock", "host_bus": "unix:path=/run/user/1000/bus"}
+        self.assertEqual(self.spawned(s, ["run", "web", "--", "kitty", "-e", "sh"]), ["kitty", "-e", "sh"])
+
+    def test_host_bus_points_the_app_at_the_recorded_host_bus(self):
+        s = {"niri_socket": "/x.sock", "host_bus": "unix:path=/run/user/1000/bus"}
+        self.assertEqual(self.spawned(s, ["run", "--host-bus", "web", "--", "kitty"]),
+                         ["env", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus", "kitty"])
+
+    def test_host_bus_without_recorded_address_fails(self):
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()) as err:
+            self.spawned({"niri_socket": "/x.sock", "host_bus": None}, ["run", "--host-bus", "web", "--", "kitty"])
+        self.assertIn("--host-bus", err.getvalue())
+
+    def test_option_after_name_is_rejected_not_spawned(self):
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()) as err:
+            self.spawned({"niri_socket": "/x.sock", "host_bus": None}, ["run", "web", "--host-bus", "--", "kitty"])
+        self.assertIn("options go before the name", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

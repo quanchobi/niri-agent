@@ -25,7 +25,7 @@ if [[ ${1:-} == --uninstall ]]; then
     exit 0
 fi
 
-for cmd in niri python3; do
+for cmd in niri python3 dbus-daemon; do
     command -v "$cmd" >/dev/null || { echo "missing required command: $cmd" >&2; exit 1; }
 done
 [[ -f $CONFIG ]] || { echo "niri config not found at $CONFIG" >&2; exit 1; }

@@ -21,11 +21,13 @@ flowchart LR
 - **Input:** a small built-in Wayland client talks to the nested compositor's `zwlr_virtual_pointer_v1` and `zwp_virtual_keyboard_v1`. Keystrokes use a generated XKB keymap, so any Unicode text types correctly regardless of your layout. Since the protocols are bound on the nested display, nothing reaches your desktop. No `ydotool`, `wtype` or `grim` needed.
 - **Screenshots:** the nested niri's own `screenshot-screen` IPC action. Screenshot pixels are the click coordinates.
 - **Hidden-window stalls:** the host sends frame callbacks to windows on hidden workspaces only about once a second. The nested niri runs with `vblank_mode=0` (Mesa swap interval 0), so its event loop never blocks on those and input and IPC stay fast while you're not watching.
+- **Private session bus:** each session runs its own `dbus-daemon`, and everything launched inside talks to it instead of your session bus. Without this, a flatpak app's file dialog goes through `xdg-desktop-portal` on your bus and opens on your desktop, and single-instance apps hand their window to a copy already running on your desktop. The private bus can only start `flatpak-portal` and the Flatpak session helper, which `flatpak run` and sandboxed helpers need. It runs no `xdg-desktop-portal` or document portal: connecting those to your desktop's document portal would give sandboxed apps host-level trust. `run --host-bus` connects one app to your bus when it needs your keyring or dconf.
 
 ## Requirements
 
 - niri 25.11 or newer (config `include`). Developed and tested on niri 26.04.
 - Python 3.9+ (stdlib only), Linux.
+- `dbus-daemon` (the reference D-Bus daemon, from the `dbus` package) for the per-session bus.
 - Mesa GPU drivers (the `vblank_mode=0` stall fix is Mesa-specific).
 - Optional: `xwayland-satellite` for X11 apps inside sessions; `fuzzel` (or any dmenu-style launcher) for `niri-agent menu`.
 
@@ -58,6 +60,7 @@ niri-agent start                       # session "a1" on the focused output, 128
 niri-agent start web --size 1600x1000 --output DP-8
 
 niri-agent run web -- firefox --new-instance --profile /tmp/agent-ff https://example.com
+niri-agent run --host-bus web -- seahorse   # this app gets your session bus (keyring, dconf); options go before the name
 niri-agent screenshot web              # {"path": ".../shots/<ts>.png", "width": 1600, "height": 1000}
 niri-agent click web 640 400           # --button left|right|middle, --double
 niri-agent type web "hello, wörld"     # "-" reads stdin
@@ -101,6 +104,8 @@ binds {
 - A nested niri window always has app-id and title `niri`, so the launch rule matches any nested niri that opens during the ~2–3 s of `start`. Starts are serialized with a lock file, but a nested niri you open by hand in that window lands on the agent workspace.
 - Keys go straight to the focused app in the session; they never trigger nested-niri keybindings. Use `niri-agent msg` for window management.
 - Sessions have their own clipboard (the nested compositor's), separate from yours.
+- Apps on the private bus have no portals, keyring, dconf writes, notifications or accessibility bus. Flatpak file dialogs silently cancel; pass files on the command line instead (`niri-agent run web -- flatpak run org.example.App /path/to/file`). Theme settings normally read through the settings portal fall back to defaults (e.g. no dark mode).
+- `run --host-bus` apps are back on your bus, so their portal dialogs open on your desktop again.
 - If the nested niri crashes, `list` shows `"alive": false`; run `niri-agent stop <name>` to clean up.
 
 ## Development
